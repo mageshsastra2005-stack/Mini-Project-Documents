@@ -1,0 +1,151 @@
+import streamlit as st
+import pandas as pd
+import joblib
+import time
+import numpy as np
+import scapy.all as scapy
+import threading
+from datetime import datetime
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# --- 1. SHARED DATA & ASSETS ---
+if 'shared_stats' not in st.session_state:
+    # Added 'tx' and 'prev_tx' to track outgoing traffic
+    st.session_state['shared_stats'] = {'rx': 0, 'tx': 0, 'prev_rx': 0, 'prev_tx': 0, 'total_captured': 0}
+
+@st.cache_resource
+def load_assets():
+    try:
+        model = joblib.load('blackhole_model.pkl')
+        scaler = joblib.load('scaler.pkl')
+        return model, scaler
+    except:
+        return None, None
+
+model, scaler = load_assets()
+
+# --- 2. UPDATED SNIFFER THREAD (Tracks RX and TX) ---
+def start_sniffer(stats_ref):
+    # Get local IP to distinguish IN from OUT
+    try:
+        local_ip = scapy.get_if_addr(scapy.conf.iface)
+    except:
+        local_ip = "127.0.0.1"
+
+    def packet_callback(pkt):
+        if pkt.haslayer(scapy.IP):
+            stats_ref['total_captured'] += 1
+            if pkt[scapy.IP].dst == local_ip:
+                stats_ref['rx'] += 1
+            elif pkt[scapy.IP].src == local_ip:
+                stats_ref['tx'] += 1
+
+    try:
+        print(f"\n[SUCCESS] Sniffer active on {local_ip}. Monitoring Bi-directional traffic...")
+        scapy.sniff(prn=packet_callback, store=0)
+    except Exception as e:
+        print(f"Sniffer error: {e}")
+
+if 'sniffer_active' not in st.session_state:
+    thread = threading.Thread(target=start_sniffer, args=(st.session_state['shared_stats'],), daemon=True)
+    thread.start()
+    st.session_state.sniffer_active = True
+
+# --- 3. UI DASHBOARD CONFIG ---
+st.set_page_config(page_title="MANET IDS Dashboard", layout="wide")
+st.title("🛡️ MANET Intrusion Detection System (Ratio-Aware)")
+st.markdown("---")
+
+col_left, col_mid, col_right = st.columns([1, 1, 1])
+
+with col_left:
+    st.subheader("📡 Real-Time Status")
+    status_placeholder = st.empty()
+    pdr_gauge = st.empty()
+
+with col_mid:
+    st.subheader("📊 Network Metrics")
+    metrics_table = st.empty()
+    reasoning_box = st.empty()
+
+with col_right:
+    st.subheader("📈 Traffic Analysis")
+    chart_placeholder = st.empty()
+
+# --- 4. DETECTION LOOP WITH RATIO LOGIC ---
+if 'history_log' not in st.session_state:
+    st.session_state.history_log = []
+
+while True:
+    stats = st.session_state['shared_stats']
+    
+    # Calculate Deltas
+    delta_rx = stats['rx'] - stats['prev_rx']
+    delta_tx = stats['tx'] - stats['prev_tx']
+    stats['prev_rx'], stats['prev_tx'] = stats['rx'], stats['tx']
+    
+    # 1. Feature Vector (Balanced 13)
+    features = np.zeros((1, 13)) 
+    features[0, 0] = delta_rx                     # Delta Received Packets
+    features[0, 3] = delta_tx                     # Delta Sent Packets
+    features[0, 6] = 1                            # Active Flow Entries
+    features[0, 8] = 500                          # Port alive Duration
+    features[0, 12] = stats['total_captured']      # Received Bytes proxy
+    
+    # 2. Logic-Based Filtering (The Speed Test Fix)
+    verdict, reason, color, pdr_estimate = "", "", "", 100.0
+    
+    if delta_rx < 10:
+        verdict, color = "IDLE", "blue"
+        reason = "System idle. Low packet throughput."
+    elif delta_rx > 600 and delta_tx > 40:
+        # SPEED TEST FIX: High RX but also significant TX (Acks/Upload)
+        verdict, color = "NORMAL (HIGH LOAD)", "green"
+        reason = "High volume detected, but bi-directional flow confirms legitimate traffic (e.g., Speed Test)."
+        pdr_estimate = 96.0
+    elif 10 <= delta_rx <= 600:
+        verdict, color = "NORMAL ACTIVE", "green"
+        reason = "Traffic behavior within standard MANET operational bounds."
+        pdr_estimate = 98.5
+    else:
+        # POTENTIAL ATTACK - Invoke SVM
+        if model and scaler:
+            X_scaled = scaler.transform(features)
+            prediction = model.predict(X_scaled)
+            
+            if prediction[0] == 0:
+                verdict, color = "⚠️ BLACKHOLE DETECTED", "red"
+                reason = "Asymmetric traffic detected: High RX without corresponding TX/ACK flow."
+                pdr_estimate = max(5.0, 100.0 - (delta_rx / 15)) 
+            else:
+                verdict, color = "HIGH LOAD (NORMAL)", "green"
+                reason = "Heavy traffic volume, but SVM pattern matches normal behavior."
+                pdr_estimate = 94.0
+
+    # 3. Update UI
+    status_placeholder.markdown(f"## Verdict: :{color}[{verdict}]")
+    
+    pdr_color = "green" if pdr_estimate > 80 else "orange" if pdr_estimate > 50 else "red"
+    pdr_gauge.markdown(f"""
+        <div style="text-align: center; padding: 10px; border: 2px solid {pdr_color}; border-radius: 10px;">
+            <p style="margin: 0; font-size: 14px;">Estimated PDR</p>
+            <h1 style="color: {pdr_color}; margin: 0;">{pdr_estimate:.1f}%</h1>
+        </div>
+    """, unsafe_allow_html=True)
+
+    reasoning_box.info(f"**AI Reasoning:** {reason}")
+
+    metrics_data = pd.DataFrame({
+        "Metric": ["RX Velocity", "TX Velocity", "Total Packets", "Node State"],
+        "Value": [f"{delta_rx} pkts", f"{delta_tx} pkts", str(stats['total_captured']), str(verdict)],
+        "Significance": ["Incoming", "Outgoing (Acks)", "Historical", "Current Logic"]
+    })
+    metrics_table.table(metrics_data)
+
+    st.session_state.history_log.append({"Time": datetime.now().strftime('%H:%M:%S'), "RX": delta_rx, "TX": delta_tx})
+    chart_placeholder.line_chart(pd.DataFrame(st.session_state.history_log).set_index('Time')[['RX', 'TX']].tail(30))
+
+    time.sleep(2)
+    st.rerun()
